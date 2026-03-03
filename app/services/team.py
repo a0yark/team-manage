@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 from app.models import Team, TeamAccount, RedemptionCode
 from app.services.chatgpt import ChatGPTService
 from app.services.encryption import encryption_service
+from app.services.settings import settings_service
 from app.utils.token_parser import TokenParser
 from app.utils.jwt_parser import JWTParser
 from app.utils.time_utils import get_now
@@ -26,8 +27,27 @@ class TeamService:
         """初始化 Team 管理服务"""
         from app.services.chatgpt import chatgpt_service
         self.chatgpt_service = chatgpt_service
+        self.settings_service = settings_service
         self.token_parser = TokenParser()
         self.jwt_parser = JWTParser()
+
+    async def _is_reserve_one_slot_enabled(self, db_session: AsyncSession) -> bool:
+        """Whether reserve-one-slot mode is enabled."""
+        try:
+            return await self.settings_service.is_reserve_one_slot_enabled(db_session)
+        except Exception:
+            return False
+
+    def _get_effective_max_members(self, team: Team, reserve_one_slot_enabled: bool) -> int:
+        """Effective team capacity under reserve-one-slot policy."""
+        raw_max = max(int(team.max_members or 0), 0)
+        if not reserve_one_slot_enabled:
+            return raw_max
+        return max(raw_max - 1, 0)
+
+    def _get_remaining_spots_for_team(self, team: Team, reserve_one_slot_enabled: bool) -> int:
+        effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
+        return max(effective_max - int(team.current_members or 0), 0)
 
     async def _handle_api_error(self, result: Dict[str, Any], team: Team, db_session: AsyncSession) -> bool:
         """
@@ -85,8 +105,10 @@ class TeamService:
             logger.warning(f"检测到 Team 席位已满 (msg={error_msg}), 更新 Team {team.id} ({team.email}) 状态为 full")
             team.status = "full"
             # 修正当前成员数以防万一
-            if team.current_members < team.max_members:
-                team.current_members = team.max_members
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
+            if team.current_members < effective_max:
+                team.current_members = effective_max
             await db_session.commit()
             return True
 
@@ -230,6 +252,7 @@ class TeamService:
             结果字典,包含 success, team_id (第一个导入的), message, error
         """
         try:
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
             # 1. 检查并尝试刷新 Token (如果 AT 缺失或过期)
             is_at_valid = False
             if access_token:
@@ -415,7 +438,8 @@ class TeamService:
                 # 确定状态
                 status = "active"
                 max_members = team.max_members if 'team' in locals() and team else 6
-                if current_members >= max_members:
+                effective_max_members = max(max_members - 1, 0) if reserve_one_slot_enabled else max_members
+                if current_members >= effective_max_members:
                     status = "full"
                 elif expires_at and expires_at < datetime.now():
                     status = "expired"
@@ -587,7 +611,9 @@ class TeamService:
             
             # 自动维护 active/full 状态 (仅当当前处于这两者之一或刚更新了 max_members/status)
             if team.status in ["active", "full"]:
-                if team.current_members >= team.max_members:
+                reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+                effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
+                if team.current_members >= effective_max:
                     team.status = "full"
                 else:
                     team.status = "active"
@@ -961,7 +987,9 @@ class TeamService:
 
             # 7. 确定状态
             status = "active"
-            if current_members >= team.max_members:
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
+            if current_members >= effective_max:
                 status = "full"
             elif expires_at and expires_at < datetime.now():
                 status = "expired"
@@ -1280,8 +1308,10 @@ class TeamService:
             # 4. 更新成员数 (如果是按席位算的，撤回邀请应该减少)
             if team.current_members > 0:
                 team.current_members -= 1
-            
-            if team.current_members < team.max_members:
+
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
+            if team.current_members < effective_max:
                 if team.status == "full":
                     team.status = "active"
 
@@ -1352,6 +1382,17 @@ class TeamService:
                     "error": "Team 已过期,无法添加成员"
                 }
 
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
+            if team.current_members >= effective_max:
+                team.status = "full"
+                await db_session.commit()
+                return {
+                    "success": False,
+                    "message": None,
+                    "error": "Team 已满,无法添加成员"
+                }
+
             # 3. 确保 AT Token 有效
             access_token = await self.ensure_access_token(team, db_session)
             if not access_token:
@@ -1393,7 +1434,7 @@ class TeamService:
 
             # 5. 更新成员数
             team.current_members += 1
-            if team.current_members >= team.max_members:
+            if team.current_members >= effective_max:
                 team.status = "full"
 
             await db_session.commit()
@@ -1492,7 +1533,9 @@ class TeamService:
                 team.current_members -= 1
 
             # 更新状态
-            if team.current_members < team.max_members:
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
+            if team.current_members < effective_max:
                 if team.status == "full":
                     team.status = "active"
 
@@ -1532,22 +1575,26 @@ class TeamService:
             结果字典,包含 success, teams, error
         """
         try:
-            # 查询 status='active' 且 current_members < max_members 的 Team
-            stmt = select(Team).where(
-                Team.status == "active",
-                Team.current_members < Team.max_members
-            )
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            # 查询 status='active' 的 Team
+            stmt = select(Team).where(Team.status == "active")
             result = await db_session.execute(stmt)
             teams = result.scalars().all()
 
             # 构建返回数据 (不包含敏感信息)
             team_list = []
             for team in teams:
+                remaining_spots = self._get_remaining_spots_for_team(team, reserve_one_slot_enabled)
+                if remaining_spots <= 0:
+                    continue
+                effective_max = self._get_effective_max_members(team, reserve_one_slot_enabled)
                 team_list.append({
                     "id": team.id,
                     "team_name": team.team_name,
                     "current_members": team.current_members,
-                    "max_members": team.max_members,
+                    "max_members": effective_max,
+                    "raw_max_members": team.max_members,
+                    "remaining_spots": remaining_spots,
                     "expires_at": team.expires_at.isoformat() if team.expires_at else None,
                     "subscription_plan": team.subscription_plan
                 })
@@ -1582,18 +1629,12 @@ class TeamService:
             剩余车位总数
         """
         try:
-            # 计算所有 active Team 的剩余车位总和
-            # remaining = max_members - current_members
-            stmt = select(
-                func.sum(Team.max_members - Team.current_members)
-            ).where(
-                Team.status == "active",
-                Team.current_members < Team.max_members
-            )
-            
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            stmt = select(Team).where(Team.status == "active")
             result = await db_session.execute(stmt)
-            total_spots = result.scalar() or 0
-            
+            teams = result.scalars().all()
+            total_spots = sum(self._get_remaining_spots_for_team(team, reserve_one_slot_enabled) for team in teams)
+
             return int(total_spots)
 
         except Exception as e:
@@ -1893,10 +1934,11 @@ class TeamService:
         获取所有活跃 Team 的总剩余车位数
         """
         try:
-            # 统计所有状态为 active 的 Team 的剩余位置
-            stmt = select(func.sum(Team.max_members - Team.current_members)).where(Team.status == "active")
+            reserve_one_slot_enabled = await self._is_reserve_one_slot_enabled(db_session)
+            stmt = select(Team).where(Team.status == "active")
             result = await db_session.execute(stmt)
-            return result.scalar() or 0
+            teams = result.scalars().all()
+            return sum(self._get_remaining_spots_for_team(team, reserve_one_slot_enabled) for team in teams)
         except Exception as e:
             logger.error(f"获取总可用车位数失败: {e}")
             return 0

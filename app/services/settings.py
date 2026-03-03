@@ -157,6 +157,20 @@ class SettingsService:
             "proxy": proxy
         }
 
+    async def is_reserve_one_slot_enabled(self, session: AsyncSession) -> bool:
+        """
+        获取“保留 1 个席位”开关。
+
+        开启后每个 Team 的可用上限将按 (max_members - 1) 计算，
+        用于防止把账号席位完全打满。
+        """
+        raw = await self.get_setting(session, "reserve_one_slot_enabled", "false")
+        return (raw or "").strip().lower() == "true"
+
+    async def update_reserve_one_slot(self, session: AsyncSession, enabled: bool) -> bool:
+        """更新“保留 1 个席位”开关。"""
+        return await self.update_setting(session, "reserve_one_slot_enabled", str(enabled).lower())
+
     async def update_proxy_config(
         self,
         session: AsyncSession,

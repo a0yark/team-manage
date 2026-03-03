@@ -1136,7 +1136,8 @@ async def settings_page(
                 "log_level": log_level,
                 "webhook_url": await settings_service.get_setting(db, "webhook_url", ""),
                 "low_stock_threshold": await settings_service.get_setting(db, "low_stock_threshold", "10"),
-                "api_key": await settings_service.get_setting(db, "api_key", "")
+                "api_key": await settings_service.get_setting(db, "api_key", ""),
+                "reserve_one_slot_enabled": await settings_service.get_setting(db, "reserve_one_slot_enabled", "false")
             }
         )
 
@@ -1164,6 +1165,7 @@ class WebhookSettingsRequest(BaseModel):
     webhook_url: str = Field("", description="Webhook URL")
     low_stock_threshold: int = Field(10, description="库存阈值")
     api_key: str = Field("", description="API Key")
+    reserve_one_slot_enabled: bool = Field(False, description="是否每个 Team 保留 1 个席位")
 
 
 @router.post("/settings/proxy")
@@ -1285,7 +1287,8 @@ async def update_webhook_settings(
         settings = {
             "webhook_url": webhook_data.webhook_url.strip(),
             "low_stock_threshold": str(webhook_data.low_stock_threshold),
-            "api_key": webhook_data.api_key.strip()
+            "api_key": webhook_data.api_key.strip(),
+            "reserve_one_slot_enabled": str(webhook_data.reserve_one_slot_enabled).lower()
         }
 
         success = await settings_service.update_settings(db, settings)

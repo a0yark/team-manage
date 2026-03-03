@@ -129,19 +129,18 @@ class RedeemFlowService:
                     logger.info(f"自动选择 Team: 排除用户 {email} 已加入的 Team IDs: {exclude_team_ids}")
 
             # 2. 查询可用 Team，按过期时间升序排序
-            stmt = select(Team).where(
-                Team.status == "active",
-                Team.current_members < Team.max_members
-            )
+            reserve_one_slot_enabled = await self.team_service._is_reserve_one_slot_enabled(db_session)
+            stmt = select(Team).where(Team.status == "active")
             
             # 排除已加入的 Team
             if exclude_team_ids:
                 stmt = stmt.where(Team.id.not_in(exclude_team_ids))
             
-            stmt = stmt.order_by(Team.expires_at.asc()).limit(1)
+            stmt = stmt.order_by(Team.expires_at.asc())
 
             result = await db_session.execute(stmt)
-            team = result.scalar_one_or_none()
+            all_teams = result.scalars().all()
+            team = next((t for t in all_teams if t.current_members < self.team_service._get_effective_max_members(t, reserve_one_slot_enabled)), None)
 
             if not team:
                 reason = "没有可用的 Team"
@@ -184,6 +183,7 @@ class RedeemFlowService:
         current_target_team_id = team_id
         last_error = "未知错误"
         current_record_id = None # 用于回滚时定位具体记录
+        reserve_one_slot_enabled = await self.team_service._is_reserve_one_slot_enabled(db_session)
 
         for attempt in range(max_retries):
             # 彻底确保会话处于干净状态，防止 "A transaction is already begun" 错误
@@ -243,7 +243,8 @@ class RedeemFlowService:
                             continue
                         return {"success": False, "error": f"Team {team_id_final} 不存在"}
                     
-                    if team.current_members >= team.max_members:
+                    effective_max = self.team_service._get_effective_max_members(team, reserve_one_slot_enabled)
+                    if team.current_members >= effective_max:
                         if current_target_team_id is None and attempt < max_retries - 1:
                             logger.warning(f"选择的 Team {team_id_final} 已满, 尝试下一次循环")
                             continue 
@@ -288,7 +289,7 @@ class RedeemFlowService:
 
                     # 增加 Team 成员数占位
                     team.current_members += 1
-                    if team.current_members >= team.max_members:
+                    if team.current_members >= effective_max:
                         team.status = "full"
                     
                     # 记录信息供 Phase 2 使用
@@ -481,7 +482,8 @@ class RedeemFlowService:
                 if team:
                     if team.current_members > 0:
                         team.current_members -= 1
-                    if team.status == "full" and team.current_members < team.max_members:
+                    effective_max = self.team_service._get_effective_max_members(team, reserve_one_slot_enabled)
+                    if team.status == "full" and team.current_members < effective_max:
                         team.status = "active"
             logger.info(f"已回退兑换占位: code={code}, team_id={team_id}")
         except Exception as e:
